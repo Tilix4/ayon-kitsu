@@ -3,7 +3,7 @@ import time
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import httpx
-from nxtools import logging
+from nxtools import log_traceback, logging
 
 from ayon_server.auth.session import Session
 from ayon_server.entities import FolderEntity, ProjectEntity, UserEntity
@@ -131,6 +131,7 @@ async def create_access_group(
         if not name:
             settings = await addon.get_studio_settings()
             name = settings.sync_settings.sync_users.access_group
+        logging.debug(f"create_access_group: ensuring access group '{name}' exists")
         session = await Session.create(user)
         headers = {"Authorization": f"Bearer {session.token}"}
         # Check if group already exists
@@ -139,12 +140,18 @@ async def create_access_group(
                 f"{entity_dict['ayon_server_url']}/api/accessGroups/_",
                 headers=headers,
             )
+        if response.status_code != 200:
+            logging.warning(
+                f"create_access_group: failed to list access groups: "
+                f"{response.status_code} {response.text}"
+            )
 
         for group in response.json():
             if group["name"] == name:
                 # access group already exists
                 return
 
+        logging.info(f"Creating access group '{name}'")
         # Create a new access group
         payload = json.dumps(
             {
@@ -160,13 +167,19 @@ async def create_access_group(
         )
 
         async with httpx.AsyncClient() as client:
-            return await client.put(
+            res = await client.put(
                 f"{entity_dict['ayon_server_url']}/api/accessGroups/{name}/_",
                 content=payload,
                 headers=headers,
             )
-    except Exception as e:
-        print(e)
+        if res.status_code not in (200, 201, 204):
+            logging.warning(
+                f"create_access_group: failed to create access group "
+                f"'{name}': {res.status_code} {res.text}"
+            )
+        return res
+    except Exception:
+        log_traceback(f"create_access_group failed for access group '{name}'")
 
 
 def match_ayon_roles_with_kitsu_role(role: str) -> dict[str, bool]:
@@ -269,7 +282,8 @@ async def sync_person(
     try:
         ayon_user = await UserEntity.load(username)
     except Exception:
-        pass
+        logging.debug(f"sync_person: no existing Ayon user '{username}' found")
+
     target_user = await get_user_by_kitsu_id(entity_id)
 
     # User exists but doesn't have a kitsuId assigned it it
@@ -277,34 +291,64 @@ async def sync_person(
         target_user = ayon_user
 
     if target_user:  # Update user
+        logging.debug(
+            f"sync_person: updating existing user '{target_user.name}'"
+            f" (kitsuId={entity_id}) -> '{username}'"
+        )
         try:
             session = await Session.create(user)
             headers = {"Authorization": f"Bearer {session.token}"}
             ayon_server_url = entity_dict["ayon_server_url"]
             async with httpx.AsyncClient() as client:
-                await client.patch(
+                res = await client.patch(
                     f"{ayon_server_url}/api/users/{target_user.name}",
                     json=payload,
                     headers=headers,
+                )
+            if res.status_code not in (200, 204):
+                logging.warning(
+                    f"sync_person: failed to patch user '{target_user.name}':"
+                    f" {res.status_code} {res.text}"
                 )
             # Rename the user
             # TODO: We should discourage renaming users.
             # Maybe just change the fullName in the case there's a typo,
             # but changing username may have weird side effects.
-            payload = {"newName": username}
+            rename_payload = {"newName": username}
             async with httpx.AsyncClient() as client:
-                await client.patch(
+                res = await client.patch(
                     f"{ayon_server_url}/api/users/{target_user.name}/rename",
-                    json=payload,
+                    json=rename_payload,
                     headers=headers,
                 )
-        except Exception as e:
-            print(e)
+            if res.status_code not in (200, 204):
+                logging.warning(
+                    f"sync_person: failed to rename user "
+                    f"'{target_user.name}' -> '{username}':"
+                    f" {res.status_code} {res.text}"
+                )
+        except Exception:
+            log_traceback(
+                f"sync_person: failed to update user '{target_user.name}'"
+                f" (kitsuId={entity_id})"
+            )
     else:  # Create user
-        user = UserEntity(payload)
-        settings = await addon.get_studio_settings()
-        user.set_password(settings.sync_settings.sync_users.default_password)
-        await user.save()
+        logging.debug(
+            f"sync_person: creating new user '{username}' (kitsuId={entity_id})"
+        )
+        try:
+            new_user = UserEntity(payload)
+            settings = await addon.get_studio_settings()
+            new_user.set_password(
+                settings.sync_settings.sync_users.default_password
+            )
+            await new_user.save()
+        except Exception:
+            log_traceback(
+                f"sync_person: failed to create user '{username}'"
+                f" (kitsuId={entity_id})"
+            )
+            raise
 
     # update the id map
     existing_users[entity_id] = username
@@ -317,27 +361,40 @@ async def sync_project(
     entity_dict: "EntityDict",
     mock: bool = False,
 ):
-    logging.info("sync_project")
     (entity_id,) = required_values(entity_dict, ["id"])
+    logging.info(f"sync_project: kitsuId={entity_id}")
 
     if not project:
-        logging.info("sync project not found")
+        logging.warning(f"sync_project: project not found for kitsuId={entity_id}")
         return
 
     # only sync if the project has the correct kitsu id stored on it.
     #   will succeed when paired correctly
     if project.data.get("kitsuProjectId") != entity_id:
         logging.info(
-            f"project.data.kitsuProjectId {project.data.get('kitsuProjectId')}"
-            f" not matching entity {entity_id}"
+            f"sync_project: project '{project.name}'"
+            f" kitsuProjectId={project.data.get('kitsuProjectId')}"
+            f" not matching entity {entity_id}. Skipping."
         )
         return
 
-    await addon.ensure_kitsu(mock)
-    anatomy = await get_kitsu_project_anatomy(addon, entity_id, project)
-    anatomy_data = anatomy_to_project_data(anatomy)
+    try:
+        await addon.ensure_kitsu(mock)
+        logging.debug(f"sync_project: fetching Kitsu anatomy for '{project.name}'")
+        anatomy = await get_kitsu_project_anatomy(addon, entity_id, project)
+        anatomy_data = anatomy_to_project_data(anatomy)
 
-    await update_project(project.name, **anatomy_data)
+        logging.debug(
+            f"sync_project: updating project '{project.name}' with anatomy data"
+        )
+        await update_project(project.name, **anatomy_data)
+        logging.info(f"sync_project: project '{project.name}' updated")
+    except Exception:
+        log_traceback(
+            f"sync_project: failed to sync project '{project.name}'"
+            f" (kitsuId={entity_id})"
+        )
+        raise
 
 
 async def delete_project(
@@ -346,15 +403,25 @@ async def delete_project(
     project: "ProjectEntity",
     entity_dict: "EntityDict",
 ):
-    logging.info("delete_project")
-    session = await Session.create(user)
-    headers = {"Authorization": f"Bearer {session.token}"}
-    # Check if group already exists
-    async with httpx.AsyncClient() as client:
-        await client.delete(
-            f"{entity_dict['ayon_server_url']}/api/projects/{project.name}",
-            headers=headers,
-        )
+    logging.info(f"delete_project: deleting project '{project.name}'")
+    try:
+        session = await Session.create(user)
+        headers = {"Authorization": f"Bearer {session.token}"}
+        async with httpx.AsyncClient() as client:
+            res = await client.delete(
+                f"{entity_dict['ayon_server_url']}/api/projects/{project.name}",
+                headers=headers,
+            )
+        if res.status_code not in (200, 204):
+            logging.warning(
+                f"delete_project: failed to delete project '{project.name}':"
+                f" {res.status_code} {res.text}"
+            )
+        else:
+            logging.info(f"delete_project: project '{project.name}' deleted")
+    except Exception:
+        log_traceback(f"delete_project: failed to delete project '{project.name}'")
+        raise
 
 
 async def sync_folder(
@@ -364,107 +431,159 @@ async def sync_folder(
     existing_folders: dict[str, Any],
     entity_dict: "EntityDict",
 ):
-    target_folder = await get_folder_by_kitsu_id(
-        project.name,
-        entity_dict["id"],
-        existing_folders,
+    kitsu_id = entity_dict.get("id")
+    entity_type = entity_dict.get("type")
+    entity_name = entity_dict.get("name")
+    log_prefix = (
+        f"sync_folder({entity_type} '{entity_name}', kitsuId={kitsu_id},"
+        f" project='{project.name}')"
     )
 
-    # Add description to attrib data
-    data: dict[str, str | int | None] | None = entity_dict.get("data", {})
-    # The value of key data might be None, in that case, create a new dict
-    if data is None:
-        data = {}
-    if entity_dict.get("description"):
-        data["description"] = entity_dict["description"]
-    if target_folder is None:
-        parent_folder = None
-        if entity_dict["type"] == "Asset":
-            if entity_dict.get("entity_type_id") in existing_folders:
-                parent_id = existing_folders[entity_dict["entity_type_id"]]
-            else:
-                parent_id = await get_root_folder_id(
-                    user=user,
-                    project_name=project.name,
-                    kitsu_type="Assets",
-                    kitsu_type_id="asset",
-                    subfolder_id=entity_dict["entity_type_id"],
-                    subfolder_name=entity_dict["asset_type_name"],
-                )
-                existing_folders[entity_dict["entity_type_id"]] = parent_id
-        elif entity_dict["type"] in get_args(KitsuEntityType):
-            if entity_dict.get("parent_id") is None:
-                parent_id = await get_root_folder_id(
-                    user=user,
-                    project_name=project.name,
-                    kitsu_type=f"{entity_dict['type']}s",
-                    kitsu_type_id=entity_dict["type"].lower(),
-                )
-            else:
-                if entity_dict.get("parent_id") in existing_folders:
-                    parent_id = existing_folders[entity_dict["parent_id"]]
+    try:
+        logging.debug(f"{log_prefix}: looking up existing folder")
+        target_folder = await get_folder_by_kitsu_id(
+            project.name,
+            kitsu_id,
+            existing_folders,
+        )
+
+        # Add description to attrib data
+        data: dict[str, str | int | None] | None = entity_dict.get("data", {})
+        # The value of key data might be None, in that case, create a new dict
+        if data is None:
+            data = {}
+        if entity_dict.get("description"):
+            data["description"] = entity_dict["description"]
+        if target_folder is None:
+            logging.debug(f"{log_prefix}: no existing folder found, will create")
+            parent_folder = None
+            if entity_type == "Asset":
+                if entity_dict.get("entity_type_id") in existing_folders:
+                    parent_id = existing_folders[entity_dict["entity_type_id"]]
                 else:
-                    parent_folder = await get_folder_by_kitsu_id(
-                        project.name,
-                        entity_dict["parent_id"],
-                        existing_folders,
+                    logging.debug(
+                        f"{log_prefix}: resolving root/asset-type folder for"
+                        f" entity_type_id={entity_dict.get('entity_type_id')}"
                     )
-                    if parent_folder is None:
-                        logging.warning(
-                            f"Parent folder for {entity_dict['type']}"
-                            f" {entity_dict['name']} not found. Skipping."  # noqa
+                    parent_id = await get_root_folder_id(
+                        user=user,
+                        project_name=project.name,
+                        kitsu_type="Assets",
+                        kitsu_type_id="asset",
+                        subfolder_id=entity_dict["entity_type_id"],
+                        subfolder_name=entity_dict["asset_type_name"],
+                    )
+                    existing_folders[entity_dict["entity_type_id"]] = parent_id
+            elif entity_type in get_args(KitsuEntityType):
+                if entity_dict.get("parent_id") is None:
+                    logging.debug(
+                        f"{log_prefix}: resolving root folder for type"
+                        f" '{entity_type}'"
+                    )
+                    parent_id = await get_root_folder_id(
+                        user=user,
+                        project_name=project.name,
+                        kitsu_type=f"{entity_type}s",
+                        kitsu_type_id=entity_type.lower(),
+                    )
+                else:
+                    if entity_dict.get("parent_id") in existing_folders:
+                        parent_id = existing_folders[entity_dict["parent_id"]]
+                    else:
+                        logging.debug(
+                            f"{log_prefix}: resolving parent folder"
+                            f" kitsuId={entity_dict.get('parent_id')}"
                         )
-                        return
-                    parent_id = parent_folder.id
-        else:
-            logging.warning("Unsupported entity type: ", entity_dict["type"])
-            return
-        # ensure folder type exists
-        if entity_dict["type"] not in [
-            f["name"]
-            for f in project.folder_types
-        ]:
-            logging.warning(
-                f"Folder type {entity_dict['type']} does not exist. Creating."
+                        parent_folder = await get_folder_by_kitsu_id(
+                            project.name,
+                            entity_dict["parent_id"],
+                            existing_folders,
+                        )
+                        if parent_folder is None:
+                            logging.warning(
+                                f"{log_prefix}: parent folder"
+                                f" (kitsuId={entity_dict.get('parent_id')})"
+                                " not found. Skipping."
+                            )
+                            return
+                        parent_id = parent_folder.id
+            else:
+                logging.warning(
+                    f"{log_prefix}: unsupported entity type '{entity_type}'"
+                )
+                return
+
+            # ensure folder type exists
+            if entity_type not in [
+                f["name"]
+                for f in project.folder_types
+            ]:
+                logging.warning(
+                    f"{log_prefix}: folder type '{entity_type}' does not"
+                    " exist on project. Creating it."
+                )
+                project.folder_types.append(
+                    {"name": entity_type}
+                    | CONSTANT_KITSU_MODELS.get(entity_type, {})
+                )
+                await project.save()
+                logging.debug(
+                    f"{log_prefix}: folder type '{entity_type}' added to"
+                    " project"
+                )
+
+            logging.info(f"Creating {entity_type} '{entity_name}'")
+            if not parent_folder:
+                logging.debug(
+                    f"{log_prefix}: loading parent folder id={parent_id}"
+                )
+                parent_folder = await FolderEntity.load(project.name, parent_id)
+            # Calculate the end-frame
+            data["frame_out"] = calculate_end_frame(entity_dict, parent_folder)
+
+            logging.debug(
+                f"{log_prefix}: saving new folder under parent"
+                f" id={parent_id}"
             )
-            project.folder_types.append(
-                {"name": entity_dict["type"]}
-                | CONSTANT_KITSU_MODELS.get(entity_dict["type"], {})
+            target_folder = await create_folder(
+                project_name=project.name,
+                attrib=parse_attrib(data),
+                name=entity_dict["name"],
+                folder_type=entity_type,
+                parent_id=parent_id,
+                data={"kitsuId": kitsu_id},
             )
-            await project.save()
-
-        logging.info(f"Creating {entity_dict['type']} {entity_dict['name']}")
-        if not parent_folder:
-            parent_folder = await FolderEntity.load(project.name, parent_id)
-        # Calculate the end-frame
-        data["frame_out"] = calculate_end_frame(entity_dict, parent_folder)
-
-        target_folder = await create_folder(
-            project_name=project.name,
-            attrib=parse_attrib(data),
-            name=entity_dict["name"],
-            folder_type=entity_dict["type"],
-            parent_id=parent_id,
-            data={"kitsuId": entity_dict["id"]},
-        )
-        existing_folders[entity_dict["id"]] = target_folder.id
-
-    else:
-        # Calculate the end-frame
-        data["frame_out"] = calculate_end_frame(entity_dict, target_folder)
-
-        changed = await update_folder(
-            project_name=project.name,
-            folder_id=target_folder.id,
-            attrib=parse_attrib(data),
-            name=entity_dict["name"],
-            folder_type=entity_dict["type"],
-        )
-        if changed:
+            existing_folders[kitsu_id] = target_folder.id
             logging.info(
-                f"Updating {entity_dict['type']} '{entity_dict['name']}'"
+                f"Created {entity_type} '{entity_name}' -> id={target_folder.id}"
             )
-            existing_folders[entity_dict["id"]] = target_folder.id
+
+        else:
+            logging.debug(
+                f"{log_prefix}: existing folder found (id={target_folder.id}),"
+                " updating"
+            )
+            # Calculate the end-frame
+            data["frame_out"] = calculate_end_frame(entity_dict, target_folder)
+
+            changed = await update_folder(
+                project_name=project.name,
+                folder_id=target_folder.id,
+                attrib=parse_attrib(data),
+                name=entity_dict["name"],
+                folder_type=entity_type,
+            )
+            if changed:
+                logging.info(
+                    f"Updated {entity_type} '{entity_name}'"
+                    f" -> id={target_folder.id}"
+                )
+                existing_folders[kitsu_id] = target_folder.id
+            else:
+                logging.debug(f"{log_prefix}: no changes to apply")
+    except Exception:
+        log_traceback(f"{log_prefix}: failed to sync folder")
+        raise
 
 
 async def ensure_task_type(
@@ -524,70 +643,109 @@ async def sync_task(
     existing_folders: dict[str, Any],
     entity_dict: "EntityDict",
 ):
-    if "task_status_name" in entity_dict:
-        await ensure_task_status(project, entity_dict["task_status_name"])
-
-    if "task_type_name" in entity_dict:
-        await ensure_task_type(project, entity_dict["task_type_name"])
-
-    target_task = await get_task_by_kitsu_id(
-        project.name,
-        entity_dict["id"],
-        existing_tasks,
+    kitsu_id = entity_dict.get("id")
+    entity_type = entity_dict.get("type")
+    entity_name = entity_dict.get("name")
+    log_prefix = (
+        f"sync_task({entity_type} '{entity_name}', kitsuId={kitsu_id},"
+        f" project='{project.name}')"
     )
 
-    if target_task is None:
-        # Sync task
-        if entity_dict.get("entity_id") in existing_folders:
-            parent_id = existing_folders[entity_dict["entity_id"]]
-        else:
-            parent_folder = await get_folder_by_kitsu_id(
-                project.name, entity_dict["entity_id"], existing_folders
+    try:
+        if "task_status_name" in entity_dict:
+            logging.debug(
+                f"{log_prefix}: ensuring task status"
+                f" '{entity_dict['task_status_name']}' exists"
             )
+            await ensure_task_status(project, entity_dict["task_status_name"])
 
-            if parent_folder:
-                parent_id = parent_folder.id
+        if "task_type_name" in entity_dict:
+            logging.debug(
+                f"{log_prefix}: ensuring task type"
+                f" '{entity_dict['task_type_name']}' exists"
+            )
+            await ensure_task_type(project, entity_dict["task_type_name"])
+
+        logging.debug(f"{log_prefix}: looking up existing task")
+        target_task = await get_task_by_kitsu_id(
+            project.name,
+            kitsu_id,
+            existing_tasks,
+        )
+
+        if target_task is None:
+            logging.debug(f"{log_prefix}: no existing task found, will create")
+            # Sync task
+            if entity_dict.get("entity_id") in existing_folders:
+                parent_id = existing_folders[entity_dict["entity_id"]]
             else:
-                # The new task type haven't bin implemented in Ayon yet
+                logging.debug(
+                    f"{log_prefix}: resolving parent folder"
+                    f" kitsuId={entity_dict.get('entity_id')}"
+                )
+                parent_folder = await get_folder_by_kitsu_id(
+                    project.name, entity_dict["entity_id"], existing_folders
+                )
+
+                if parent_folder:
+                    parent_id = parent_folder.id
+                else:
+                    # The new task type haven't bin implemented in Ayon yet
+                    logging.warning(
+                        f"{log_prefix}: parent folder"
+                        f" (kitsuId={entity_dict.get('entity_id')}) not found."
+                        " Task type isn't supported yet. Skipping."
+                    )
+                    return
+
+            if "task_type_name" not in entity_dict:
                 logging.warning(
-                    f"The type '{entity_dict['name']}' isn't implemented yet."
-                    f"Currently they aren't supported"
+                    f"{log_prefix}: task_type_name missing from payload."
+                    " Skipping."
                 )
                 return
 
-        logging.info(f"Creating {entity_dict['type']} '{entity_dict['name']}'")
-
-        if "task_type_name" not in entity_dict:
-            logging.warning(
-                f"Task type not found for {entity_dict['name']}'"
+            logging.info(f"Creating Task '{entity_name}'")
+            logging.debug(
+                f"{log_prefix}: saving new task under parent id={parent_id}"
             )
-            return
-
-        target_task = await create_task(
-            project_name=project.name,
-            folder_id=parent_id,
-            status=entity_dict["task_status_name"],
-            task_type=entity_dict["task_type_name"],
-            name=entity_dict["name"],
-            data={"kitsuId": entity_dict["id"]},
-            assignees=entity_dict["assignees"],
-        )
-        existing_tasks[entity_dict["id"]] = target_task.id
-
-    else:
-        changed = await update_task(
-            project_name=project.name,
-            task_id=target_task.id,
-            name=entity_dict.get("name", target_task.name),
-            assignees=entity_dict.get("assignees", target_task.assignees),
-            status=entity_dict.get("task_status_name", target_task.status),
-            task_type=entity_dict.get("task_type_name", target_task.task_type),
-        )
-        if changed:
-            logging.info(
-                f"Updating {entity_dict['type']} '{entity_dict['name']}'"
+            target_task = await create_task(
+                project_name=project.name,
+                folder_id=parent_id,
+                status=entity_dict["task_status_name"],
+                task_type=entity_dict["task_type_name"],
+                name=entity_dict["name"],
+                data={"kitsuId": kitsu_id},
+                assignees=entity_dict["assignees"],
             )
-            existing_tasks[entity_dict["id"]] = target_task.id
+            existing_tasks[kitsu_id] = target_task.id
+            logging.info(f"Created Task '{entity_name}' -> id={target_task.id}")
+
+        else:
+            logging.debug(
+                f"{log_prefix}: existing task found (id={target_task.id}),"
+                " updating"
+            )
+            changed = await update_task(
+                project_name=project.name,
+                task_id=target_task.id,
+                name=entity_dict.get("name", target_task.name),
+                assignees=entity_dict.get("assignees", target_task.assignees),
+                status=entity_dict.get("task_status_name", target_task.status),
+                task_type=entity_dict.get(
+                    "task_type_name", target_task.task_type
+                ),
+            )
+            if changed:
+                logging.info(
+                    f"Updated Task '{entity_name}' -> id={target_task.id}"
+                )
+                existing_tasks[kitsu_id] = target_task.id
+            else:
+                logging.debug(f"{log_prefix}: no changes to apply")
+    except Exception:
+        log_traceback(f"{log_prefix}: failed to sync task")
+        raise
 
 
 async def sync_casting(
@@ -632,85 +790,166 @@ async def sync_casting(
 
     target_kitsu_id = entity_dict.get("target_id")
     asset_ids = entity_dict.get("asset_ids", {})
+    log_prefix = (
+        f"sync_casting(targetKitsuId={target_kitsu_id},"
+        f" project='{project.name}')"
+    )
 
     if not target_kitsu_id:
         logging.warning("SyncCasting missing target_id")
         return
 
-    # Get target folder (shot or asset)
-    target_folder = await get_folder_by_kitsu_id(
-        project.name,
-        target_kitsu_id,
-    )
-    if not target_folder:
-        logging.warning(
-            f"SyncCasting target not found for kitsuId {target_kitsu_id}"
-        )
-        return
-
-    # Get link type from settings
-    link_type = (
-        settings.sync_settings.sync_casting.casting_link_type or "breakdown"
-    )
-    # Ensure link_type has proper format: name|input_type|output_type
-    if "|" not in link_type:
-        link_type = f"{link_type}|folder|folder"
-
-    # Get existing AYON links for this target
-    existing_links = await get_links_for_output(
-        project.name,
-        target_folder.id,
-        link_type,
-    )
-
-    # Build mapping of asset_kitsu_id -> list of existing links
-    existing_links_by_asset: dict[str, list[dict]] = {}
-
-    for link in existing_links:
-        # Try to get asset_kitsu_id from link data
-        link_data = link.get("data")
-        if link_data and isinstance(link_data, dict):
-            asset_kitsu_id = link_data.get("kitsuAssetId")
-        else:
-            asset_kitsu_id = None
-
-        if not asset_kitsu_id:
-            # Fallback: try to find asset by input_id by querying the folder
-            input_id = link.get("input_id")
-            if input_id:
-                try:
-                    folder = await FolderEntity.load(project.name, input_id)
-                    asset_kitsu_id = folder.data.get("kitsuId")
-                except Exception:
-                    # Folder not found or no kitsuId, skip this link
-                    continue
-
-        if asset_kitsu_id:
-            if asset_kitsu_id not in existing_links_by_asset:
-                existing_links_by_asset[asset_kitsu_id] = []
-            existing_links_by_asset[asset_kitsu_id].append(link)
-
-    # Process each asset with its desired count
-    for asset_kitsu_id, desired_count in asset_ids.items():
-        asset_folder = await get_folder_by_kitsu_id(
+    try:
+        # Get target folder (shot or asset)
+        logging.debug(f"{log_prefix}: resolving target folder")
+        target_folder = await get_folder_by_kitsu_id(
             project.name,
-            asset_kitsu_id,
+            target_kitsu_id,
         )
-        if not asset_folder:
-            logging.debug(
-                f"SyncCasting asset not found for kitsuId "
-                f"{asset_kitsu_id}, skipping"
+        if not target_folder:
+            logging.warning(
+                f"SyncCasting target not found for kitsuId {target_kitsu_id}"
             )
-            continue
+            return
 
-        existing_count = len(existing_links_by_asset.get(asset_kitsu_id, []))
+        # Get link type from settings
+        link_type = (
+            settings.sync_settings.sync_casting.casting_link_type
+            or "breakdown"
+        )
+        # Ensure link_type has proper format: name|input_type|output_type
+        if "|" not in link_type:
+            link_type = f"{link_type}|folder|folder"
 
-        # Delete excess links (more in AYON than in Kitsu)
-        if existing_count > desired_count:
-            links_to_delete = existing_links_by_asset[asset_kitsu_id][
-                : existing_count - desired_count
-            ]
-            for link in links_to_delete:
+        # Get existing AYON links for this target
+        existing_links = await get_links_for_output(
+            project.name,
+            target_folder.id,
+            link_type,
+        )
+        logging.debug(
+            f"{log_prefix}: found {len(existing_links)} existing link(s),"
+            f" {len(asset_ids)} desired asset(s), link_type='{link_type}'"
+        )
+
+        # Build mapping of asset_kitsu_id -> list of existing links
+        existing_links_by_asset: dict[str, list[dict]] = {}
+
+        for link in existing_links:
+            # Try to get asset_kitsu_id from link data
+            link_data = link.get("data")
+            if link_data and isinstance(link_data, dict):
+                asset_kitsu_id = link_data.get("kitsuAssetId")
+            else:
+                asset_kitsu_id = None
+
+            if not asset_kitsu_id:
+                # Fallback: try to find asset by input_id by querying
+                # the folder
+                input_id = link.get("input_id")
+                if input_id:
+                    try:
+                        folder = await FolderEntity.load(
+                            project.name, input_id
+                        )
+                        asset_kitsu_id = folder.data.get("kitsuId")
+                    except Exception:
+                        # Folder not found or no kitsuId, skip this link
+                        continue
+
+            if asset_kitsu_id:
+                if asset_kitsu_id not in existing_links_by_asset:
+                    existing_links_by_asset[asset_kitsu_id] = []
+                existing_links_by_asset[asset_kitsu_id].append(link)
+
+        # Process each asset with its desired count
+        for asset_kitsu_id, desired_count in asset_ids.items():
+            asset_folder = await get_folder_by_kitsu_id(
+                project.name,
+                asset_kitsu_id,
+            )
+            if not asset_folder:
+                logging.debug(
+                    f"SyncCasting asset not found for kitsuId "
+                    f"{asset_kitsu_id}, skipping"
+                )
+                continue
+
+            existing_count = len(
+                existing_links_by_asset.get(asset_kitsu_id, [])
+            )
+
+            # Delete excess links (more in AYON than in Kitsu)
+            if existing_count > desired_count:
+                links_to_delete = existing_links_by_asset[asset_kitsu_id][
+                    : existing_count - desired_count
+                ]
+                for link in links_to_delete:
+                    await delete_entity_link(
+                        project_name=project.name,
+                        user=user,
+                        ayon_server_url=entity_dict["ayon_server_url"],
+                        link_id=link["id"],
+                    )
+                    logging.debug(
+                        f"Deleted excess casting link "
+                        f"{link.get('input_id')}->{target_folder.id} "
+                        f"(asset {asset_kitsu_id}, had {existing_count}, "
+                        f"need {desired_count})"
+                    )
+
+            # Create missing links (more in Kitsu than in AYON)
+            elif existing_count < desired_count:
+                for occurence_num in range(
+                    existing_count + 1, desired_count + 1
+                ):
+                    await create_entity_link(
+                        project_name=project.name,
+                        user=user,
+                        ayon_server_url=entity_dict["ayon_server_url"],
+                        input_id=asset_folder.id,
+                        output_id=target_folder.id,
+                        link_type=link_type,
+                        data={
+                            "kitsuAssetId": asset_kitsu_id,
+                            "kitsuTargetId": target_kitsu_id,
+                            "occurence": occurence_num,
+                        },
+                    )
+                    logging.debug(
+                        f"Created casting link "
+                        f"{asset_folder.name}->{target_folder.name} "
+                        f"(asset {asset_kitsu_id}, occurence "
+                        f"{occurence_num}/{desired_count})"
+                    )
+
+        # Handle assets that were removed from Kitsu
+        # (exist in AYON but not in count dict)
+        # Find links for assets not in the count dict
+        for link in existing_links:
+            # Try to get asset_kitsu_id from link data
+            link_data = link.get("data")
+            if link_data and isinstance(link_data, dict):
+                asset_kitsu_id = link_data.get("kitsuAssetId")
+            else:
+                asset_kitsu_id = None
+
+            if not asset_kitsu_id:
+                # Fallback: try to find asset by input_id
+                input_id = link.get("input_id")
+                if input_id:
+                    try:
+                        folder = await FolderEntity.load(
+                            project.name, input_id
+                        )
+                        asset_kitsu_id = folder.data.get("kitsuId")
+                    except Exception:
+                        # Folder not found, skip
+                        continue
+
+            # If this asset is not in the asset_ids dict,
+            # it was removed from Kitsu
+            if asset_kitsu_id and asset_kitsu_id not in asset_ids:
                 await delete_entity_link(
                     project_name=project.name,
                     user=user,
@@ -718,70 +957,13 @@ async def sync_casting(
                     link_id=link["id"],
                 )
                 logging.debug(
-                    f"Deleted excess casting link "
+                    f"Deleted stale casting link "
                     f"{link.get('input_id')}->{target_folder.id} "
-                    f"(asset {asset_kitsu_id}, had {existing_count}, "
-                    f"need {desired_count})"
+                    f"(asset {asset_kitsu_id} removed from Kitsu)"
                 )
-
-        # Create missing links (more in Kitsu than in AYON)
-        elif existing_count < desired_count:
-            for occurence_num in range(existing_count + 1, desired_count + 1):
-                await create_entity_link(
-                    project_name=project.name,
-                    user=user,
-                    ayon_server_url=entity_dict["ayon_server_url"],
-                    input_id=asset_folder.id,
-                    output_id=target_folder.id,
-                    link_type=link_type,
-                    data={
-                        "kitsuAssetId": asset_kitsu_id,
-                        "kitsuTargetId": target_kitsu_id,
-                        "occurence": occurence_num,
-                    },
-                )
-                logging.debug(
-                    f"Created casting link "
-                    f"{asset_folder.name}->{target_folder.name} "
-                    f"(asset {asset_kitsu_id}, occurence "
-                    f"{occurence_num}/{desired_count})"
-                )
-
-    # Handle assets that were removed from Kitsu
-    # (exist in AYON but not in count dict)
-    # Find links for assets not in the count dict
-    for link in existing_links:
-        # Try to get asset_kitsu_id from link data
-        link_data = link.get("data")
-        if link_data and isinstance(link_data, dict):
-            asset_kitsu_id = link_data.get("kitsuAssetId")
-        else:
-            asset_kitsu_id = None
-
-        if not asset_kitsu_id:
-            # Fallback: try to find asset by input_id
-            input_id = link.get("input_id")
-            if input_id:
-                try:
-                    folder = await FolderEntity.load(project.name, input_id)
-                    asset_kitsu_id = folder.data.get("kitsuId")
-                except Exception:
-                    # Folder not found, skip
-                    continue
-
-        # If this asset is not in the asset_ids dict, it was removed from Kitsu
-        if asset_kitsu_id and asset_kitsu_id not in asset_ids:
-            await delete_entity_link(
-                project_name=project.name,
-                user=user,
-                ayon_server_url=entity_dict["ayon_server_url"],
-                link_id=link["id"],
-            )
-            logging.debug(
-                f"Deleted stale casting link "
-                f"{link.get('input_id')}->{target_folder.id} "
-                f"(asset {asset_kitsu_id} removed from Kitsu)"
-            )
+    except Exception:
+        log_traceback(f"{log_prefix}: failed to sync casting")
+        raise
 
 
 async def push_entities(
@@ -793,6 +975,12 @@ async def push_entities(
     project = None
     if payload.project_name != "":
         project = await ProjectEntity.load(payload.project_name)
+
+    total = len(payload.entities)
+    logging.info(
+        f"push_entities: starting sync of {total} entities"
+        f" for project '{payload.project_name}'"
+    )
 
     # A mapping of kitsu entity ids to folder ids
     # they are added when a task or folder is created or updated and returned
@@ -807,66 +995,86 @@ async def push_entities(
     users = {}
 
     settings = await addon.get_studio_settings()
-    for entity_dict in payload.entities:
+    for index, entity_dict in enumerate(payload.entities, start=1):
         # required fields
         assert "type" in entity_dict
         assert "id" in entity_dict
 
-        if entity_dict["type"] not in get_args(KitsuEntityType):
+        entity_type = entity_dict["type"]
+        entity_progress = (
+            f"[{index}/{total}] {entity_type}"
+            f" '{entity_dict.get('name')}' (kitsuId={entity_dict.get('id')})"
+        )
+
+        if entity_type not in get_args(KitsuEntityType):
             logging.warning(
-                f"Unsupported kitsu entity type: {entity_dict['type']}"
+                f"{entity_progress}: unsupported kitsu entity type."
+                " Skipping."
             )
             continue
 
-        if entity_dict["type"] == "Project":
-            await sync_project(
-                addon, user, project, entity_dict, payload.mock
-            )
-        elif entity_dict["type"] == "Person":
-            if settings.sync_settings.sync_users.enabled:
-                await create_access_group(
-                    addon,
-                    user,
-                    entity_dict,
+        logging.debug(f"{entity_progress}: processing")
+
+        try:
+            if entity_type == "Project":
+                await sync_project(
+                    addon, user, project, entity_dict, payload.mock
                 )
-                await sync_person(
-                    addon,
-                    user,
-                    users,
-                    entity_dict,
-                )
-        elif entity_dict["type"] == "SyncCasting":
-            if project:
-                await sync_casting(
+            elif entity_type == "Person":
+                if settings.sync_settings.sync_users.enabled:
+                    await create_access_group(
+                        addon,
+                        user,
+                        entity_dict,
+                    )
+                    await sync_person(
+                        addon,
+                        user,
+                        users,
+                        entity_dict,
+                    )
+            elif entity_type == "SyncCasting":
+                if project:
+                    await sync_casting(
+                        addon,
+                        user,
+                        project,
+                        entity_dict,
+                        settings,
+                    )
+                else:
+                    logging.warning(
+                        f"{entity_progress}: SyncCasting received without"
+                        " project context"
+                    )
+            elif entity_type != "Task":
+                await sync_folder(
                     addon,
                     user,
                     project,
+                    folders,
                     entity_dict,
-                    settings,
                 )
             else:
-                logging.warning("SyncCasting received without project context")
-        elif entity_dict["type"] != "Task":
-            await sync_folder(
-                addon,
-                user,
-                project,
-                folders,
-                entity_dict,
+                await sync_task(
+                    addon,
+                    user,
+                    project,
+                    tasks,
+                    folders,
+                    entity_dict,
+                )
+        except Exception:
+            log_traceback(
+                f"push_entities: failed while processing {entity_progress}"
+                f" out of {total} total entities for project"
+                f" '{payload.project_name}'"
             )
-        else:
-            await sync_task(
-                addon,
-                user,
-                project,
-                tasks,
-                folders,
-                entity_dict,
-            )
+            raise
 
     logging.info(
-        f"Synced {len(payload.entities)}"
-        f" entities in {time.time() - start_time}s"
+        f"Synced {total}"
+        f" entities in {time.time() - start_time:.2f}s"
     )
 
     # pass back the map of kitsu to ayon ids
@@ -881,6 +1089,12 @@ async def remove_entities(
     start_time = time.time()
     project = await ProjectEntity.load(payload.project_name)
 
+    total = len(payload.entities)
+    logging.info(
+        f"remove_entities: starting removal of {total} entities"
+        f" for project '{payload.project_name}'"
+    )
+
     # A mapping of kitsu entity ids to folder ids
     # they are added when a task or folder are deleted and returned
     #   by the method - useful for testing
@@ -888,65 +1102,95 @@ async def remove_entities(
     tasks = {}
 
     settings = await addon.get_studio_settings()
-    for entity_dict in payload.entities:
-        if entity_dict["type"] not in get_args(KitsuEntityType):
+    for index, entity_dict in enumerate(payload.entities, start=1):
+        entity_type = entity_dict["type"]
+        entity_progress = (
+            f"[{index}/{total}] {entity_type}"
+            f" '{entity_dict.get('name')}' (kitsuId={entity_dict.get('id')})"
+        )
+
+        if entity_type not in get_args(KitsuEntityType):
             logging.warning(
-                f"Unsupported kitsu entity type: {entity_dict['type']}"
+                f"{entity_progress}: unsupported kitsu entity type."
+                " Skipping."
             )
             continue
 
-        if entity_dict["type"] == "Project":
-            if settings.delete_ayon_projects.enabled:
-                await update_project(
-                    addon,
-                    user,
-                    project,
-                    entity_dict,
+        logging.debug(f"{entity_progress}: processing removal")
+
+        try:
+            if entity_type == "Project":
+                if settings.delete_ayon_projects.enabled:
+                    await delete_project(
+                        addon,
+                        user,
+                        project,
+                        entity_dict,
+                    )
+            elif entity_type == "Person":
+                target_user = await get_user_by_kitsu_id(entity_dict["id"])
+                if not target_user:
+                    logging.debug(
+                        f"{entity_progress}: no matching Ayon user found."
+                        " Skipping."
+                    )
+                    continue
+
+                await target_user.delete()
+                logging.info(f"Deleted user '{target_user.name}'")
+
+            elif entity_type == "Task":
+                task = await get_task_by_kitsu_id(
+                    project.name,
+                    entity_dict["id"],
+                    tasks,
                 )
-        elif entity_dict["type"] == "Person":
-            target_user = await get_user_by_kitsu_id(entity_dict["id"])
-            if not target_user:
-                continue
+                if not task:
+                    logging.debug(
+                        f"{entity_progress}: no matching task found."
+                        " Skipping."
+                    )
+                    continue
 
-            await target_user.delete()
+                await delete_task(
+                    project_name=project.name,
+                    task_id=task.id,
+                    user=user,
+                )
+                logging.info(f"Deleted {entity_type} '{task.name}'")
+                tasks[entity_dict["id"]] = task.id
 
-        elif entity_dict["type"] == "Task":
-            task = await get_task_by_kitsu_id(
-                project.name,
-                entity_dict["id"],
-                tasks,
+            else:
+                folder = await get_folder_by_kitsu_id(
+                    project.name,
+                    entity_dict["id"],
+                    folders,
+                )
+                if not folder:
+                    logging.debug(
+                        f"{entity_progress}: no matching folder found."
+                        " Skipping."
+                    )
+                    continue
+
+                await delete_folder(
+                    project_name=project.name,
+                    folder_id=folder.id,
+                    user=user,
+                )
+                logging.info(f"Deleted {entity_type} '{folder.name}'")
+                folders[entity_dict["id"]] = folder.id
+        except Exception:
+            log_traceback(
+                f"remove_entities: failed while processing {entity_progress}"
+                f" out of {total} total entities for project"
+                f" '{payload.project_name}'"
             )
-            if not task:
-                continue
-
-            await delete_task(
-                project_name=project.name,
-                task_id=task.id,
-                user=user,
-            )
-            logging.info(f"Deleted {entity_dict['type']} '{task.name}'")
-            tasks[entity_dict["id"]] = task.id
-
-        else:
-            folder = await get_folder_by_kitsu_id(
-                project.name,
-                entity_dict["id"],
-                folders,
-            )
-            if not folder:
-                continue
-
-            await delete_folder(
-                project_name=project.name,
-                folder_id=folder.id,
-                user=user,
-            )
-            logging.info(f"Deleted {entity_dict['type']} '{folder.name}'")
-            folders[entity_dict["id"]] = folder.id
+            raise
 
     logging.info(
-        f"Deleted {len(payload.entities)} entities"
-        f" in {time.time() - start_time}s"
+        f"Deleted {total} entities"
+        f" in {time.time() - start_time:.2f}s"
     )
 
     # pass back the map of kitsu to ayon ids
