@@ -2,7 +2,7 @@ from typing import Any
 
 import httpx
 import re
-from nxtools import slugify, logging
+from nxtools import log_traceback, slugify, logging
 
 from ayon_server.entities import (
     ProjectEntity,
@@ -126,7 +126,20 @@ async def create_folder(
         project_name=project_name,
         payload=payload,
     )
-    await folder.save()
+    try:
+        logging.debug(
+            f"create_folder: saving '{name}' in project '{project_name}'"
+            f" parent_id={kwargs.get('parent_id')}"
+        )
+        await folder.save()
+    except Exception:
+        log_traceback(
+            f"create_folder: failed to save '{name}' in project"
+            f" '{project_name}' (parent_id={kwargs.get('parent_id')},"
+            f" data={kwargs.get('data')})"
+        )
+        raise
+
     event = {
         "topic": "entity.folder.created",
         "description": f"Folder {folder.name} created",
@@ -134,7 +147,14 @@ async def create_folder(
         "project": project_name,
     }
 
-    await dispatch_event(**event)
+    try:
+        await dispatch_event(**event)
+    except Exception:
+        log_traceback(
+            f"create_folder: folder '{folder.name}' (id={folder.id}) was"
+            " saved, but dispatching 'entity.folder.created' event failed"
+        )
+        raise
     return folder
 
 
@@ -161,14 +181,34 @@ async def update_folder(
                 folder.own_attrib.append(key)
             changed = True
     if changed:
-        await folder.save()
+        try:
+            logging.debug(
+                f"update_folder: saving folder '{folder.name}'"
+                f" (id={folder.id}) in project '{project_name}'"
+            )
+            await folder.save()
+        except Exception:
+            log_traceback(
+                f"update_folder: failed to save folder '{folder.name}'"
+                f" (id={folder_id}) in project '{project_name}'"
+            )
+            raise
+
         event = {
             "topic": "entity.folder.updated",
             "description": f"Folder {folder.name} updated",
             "summary": {"entityId": folder.id, "parentId": folder.parent_id},
             "project": project_name,
         }
-        await dispatch_event(**event)
+        try:
+            await dispatch_event(**event)
+        except Exception:
+            log_traceback(
+                f"update_folder: folder '{folder.name}' (id={folder.id})"
+                " was saved, but dispatching 'entity.folder.updated' event"
+                " failed"
+            )
+            raise
 
     return changed
 
@@ -205,14 +245,34 @@ async def create_task(
         payload=payload,
     )
 
-    await task.save()
+    try:
+        logging.debug(
+            f"create_task: saving '{name}' in project '{project_name}'"
+            f" folder_id={kwargs.get('folder_id')}"
+        )
+        await task.save()
+    except Exception:
+        log_traceback(
+            f"create_task: failed to save '{name}' in project"
+            f" '{project_name}' (folder_id={kwargs.get('folder_id')},"
+            f" data={kwargs.get('data')})"
+        )
+        raise
+
     event = {
         "topic": "entity.task.created",
         "description": f"Task {task.name} created",
         "summary": {"entityId": task.id, "parentId": task.parent_id},
         "project": project_name,
     }
-    await dispatch_event(**event)
+    try:
+        await dispatch_event(**event)
+    except Exception:
+        log_traceback(
+            f"create_task: task '{task.name}' (id={task.id}) was saved,"
+            " but dispatching 'entity.task.created' event failed"
+        )
+        raise
     return task
 
 
@@ -240,14 +300,33 @@ async def update_task(
                     task.own_attrib.append(key)
                 changed = True
     if changed:
-        await task.save()
+        try:
+            logging.debug(
+                f"update_task: saving task '{task.name}' (id={task.id})"
+                f" in project '{project_name}'"
+            )
+            await task.save()
+        except Exception:
+            log_traceback(
+                f"update_task: failed to save task '{task.name}'"
+                f" (id={task_id}) in project '{project_name}'"
+            )
+            raise
+
         event = {
             "topic": "entity.task.updated",
             "description": f"Task {task.name} updated",
             "summary": {"entityId": task.id, "parentId": task.parent_id},
             "project": project_name,
         }
-        await dispatch_event(**event)
+        try:
+            await dispatch_event(**event)
+        except Exception:
+            log_traceback(
+                f"update_task: task '{task.name}' (id={task.id}) was saved,"
+                " but dispatching 'entity.task.updated' event failed"
+            )
+            raise
     return changed
 
 
@@ -386,12 +465,20 @@ async def create_entity_link(
     if data:
         payload["data"] = data
 
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            f"{ayon_server_url}/api/projects/{project_name}/links",
-            json=payload,
-            headers=headers,
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                f"{ayon_server_url}/api/projects/{project_name}/links",
+                json=payload,
+                headers=headers,
+            )
+    except Exception:
+        log_traceback(
+            f"create_entity_link: request to create link"
+            f" {input_id}->{output_id} type '{link_type}' failed"
         )
+        raise
+
     if res.status_code not in (200, 201):
         logging.warning(
             f"Failed to create link {input_id}->{output_id} "
@@ -426,11 +513,18 @@ async def delete_entity_link(
     session = await Session.create(user)
     headers = {"Authorization": f"Bearer {session.token}"}
 
-    async with httpx.AsyncClient() as client:
-        res = await client.delete(
-            f"{ayon_server_url}/api/projects/{project_name}/links/{link_id}",
-            headers=headers,
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.delete(
+                f"{ayon_server_url}/api/projects/{project_name}"
+                f"/links/{link_id}",
+                headers=headers,
+            )
+    except Exception:
+        log_traceback(
+            f"delete_entity_link: request to delete link {link_id} failed"
         )
+        raise
 
     if res.status_code not in (200, 204):
         logging.warning(
